@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="cs">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>ORIS Karaoke Web Player</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <aside id="side">
+      <div class="brand">ORIS Karaoke</div>
+
+      <div class="row">
+        <button id="btnOpenFolder" class="primary">Otevřít složku</button>
+        <button id="btnOpenFiles">Vybrat soubory</button>
+      </div>
+
+      <input id="filePicker" type="file" multiple hidden>
+
+      <label class="small-label">Hledat</label>
+      <input id="search" type="search" placeholder="název / interpret / soubor...">
+
+      <div class="row small">
+        <button id="btnPrev">⏮</button>
+        <button id="btnPlay">▶ / ⏸</button>
+        <button id="btnNext">⏭</button>
+        <button id="btnFull">Fullscreen</button>
+      </div>
+
+      <div class="row small">
+        <button id="btnOffsetMinus">−100 ms</button>
+        <button id="btnOffsetPlus">+100 ms</button>
+      </div>
+
+      <div class="status">
+        <div><b>Offset:</b> <span id="offsetText">0 ms</span></div>
+        <div><b>Skladeb:</b> <span id="countText">0</span></div>
+        <div><b>Audio nenalezeno:</b> <span id="missingText">0</span></div>
+      </div>
+
+      <div id="list"></div>
+    </aside>
+
+    <main id="stage">
+      <div id="topbar">
+        <div>
+          <div id="title">Vyber složku s karaoke</div>
+          <div id="artist"></div>
+        </div>
+        <div id="time">00:00 / 00:00</div>
+      </div>
+
+      <section id="canvas">
+        <div id="prevLine" class="line muted"></div>
+        <div id="currentLine" class="line current">Karaoke</div>
+        <div id="nextLine" class="line muted"></div>
+      </section>
+
+      <audio id="audio" controls preload="metadata"></audio>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
