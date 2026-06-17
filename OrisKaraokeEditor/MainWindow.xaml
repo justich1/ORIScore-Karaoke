@@ -1,7 +1,7 @@
 <Window x:Class="OrisKaraokeEditorWpf.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="ORIS Karaoke Tap Editor v2"
+        Title="ORIScore Karaoke Tap Editor"
         Width="1460"
         Height="860"
         MinWidth="1050"
