@@ -66,7 +66,53 @@ public sealed class KaraokeSong
 
             if (string.IsNullOrWhiteSpace(line.Text) && line.Words.Count > 0)
                 line.Text = string.Join(" ", line.Words.Select(w => w.Text));
+
+            EnsureCharPositions(line);
         }
+    }
+
+    private static void EnsureCharPositions(KaraokeLine line)
+    {
+        if (line.Words.Count == 0)
+            return;
+
+        string text = line.Text ?? "";
+
+        bool hasUsablePositions = line.Words.Any(w =>
+            w.CharLength > 0
+            && w.CharStart >= 0
+            && w.CharStart < text.Length
+            && w.CharStart + w.CharLength <= text.Length);
+
+        if (hasUsablePositions)
+            return;
+
+        // Starší .ock soubory CharStart/CharLength neměly.
+        // Pro ně dopočítáme pozice podle původního textu slov, aby zůstaly kompatibilní.
+        var parts = new List<string>();
+        int cursor = 0;
+
+        foreach (var word in line.Words)
+        {
+            string part = word.Text ?? "";
+            if (part.Length == 0)
+            {
+                word.CharStart = cursor;
+                word.CharLength = 0;
+                continue;
+            }
+
+            if (parts.Count > 0)
+                cursor++;
+
+            word.CharStart = cursor;
+            word.CharLength = part.Length;
+            parts.Add(part);
+            cursor += part.Length;
+        }
+
+        if (string.IsNullOrWhiteSpace(line.Text))
+            line.Text = string.Join(" ", parts);
     }
 
     public int FindLineIndexAt(int ms)
@@ -165,4 +211,10 @@ public sealed class KaraokeWord
     public string Text { get; set; } = "";
     public int TimeMs { get; set; }
     public int EndMs { get; set; }
+
+    // Pozice časované části/slabiky ve vizuálním KaraokeLine.Text.
+    // Nový konvertor nechává řádek jako normální text bez lomítek
+    // a player podle těchto pozic zvýrazňuje přesné KFN slabiky.
+    public int CharStart { get; set; }
+    public int CharLength { get; set; }
 }

@@ -1,9 +1,13 @@
 using Microsoft.Win32;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Documents;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Threading;
+using System.IO;
+using System.Text.Json;
+using System.ComponentModel;
 
 namespace OrisKaraokePlayerWpf;
 
@@ -20,15 +24,39 @@ public partial class MainWindow : Window
     private WindowState _oldState;
     private ResizeMode _oldResize;
     private int _offsetMs;
+    private bool _smoothLyricsScroll;
+    private const double SmoothLineFontSize = 60;
 
     public MainWindow()
     {
         InitializeComponent();
 
+        Loaded += (_, _) => LoadWindowState();
+
         _timer.Tick += (_, _) => RefreshPlayback();
         _timer.Start();
 
         RenderEmpty("Karaoke");
+    }
+
+    private static readonly string WindowSettingsDir =
+    Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "ORIScore",
+        "KaraokePlayer"
+    );
+
+    private static readonly string WindowSettingsFile =
+        Path.Combine(WindowSettingsDir, "window.json");
+
+    private sealed class SavedWindowState
+    {
+        public double Width { get; set; }
+        public double Height { get; set; }
+        public double Left { get; set; }
+        public double Top { get; set; }
+        public bool Maximized { get; set; }
+        public bool SmoothLyricsScroll { get; set; }
     }
 
     private void OpenJson_Click(object sender, RoutedEventArgs e)
@@ -220,6 +248,24 @@ public partial class MainWindow : Window
             Player.Volume = VolumeSlider.Value;
     }
 
+    private void SmoothScrollCheckBox_Changed(object sender, RoutedEventArgs e)
+    {
+        _smoothLyricsScroll = SmoothScrollCheckBox.IsChecked == true;
+        UpdateLyricsModeVisibility();
+    }
+
+    private void UpdateLyricsModeVisibility()
+    {
+        if (StaticLyricsHost == null || SmoothLyricsHost == null)
+            return;
+
+        StaticLyricsHost.Visibility = _smoothLyricsScroll ? Visibility.Collapsed : Visibility.Visible;
+        SmoothLyricsHost.Visibility = _smoothLyricsScroll ? Visibility.Visible : Visibility.Collapsed;
+
+        if (!_smoothLyricsScroll)
+            ResetLyricsScroll();
+    }
+
     private void Player_MediaOpened(object sender, RoutedEventArgs e)
     {
         _mediaReady = true;
@@ -293,10 +339,53 @@ public partial class MainWindow : Window
             return;
         }
 
-        PrevLineText.Text = lineIndex > 0 ? _song.Lines[lineIndex - 1].Text : "";
-        NextLineText.Text = lineIndex + 1 < _song.Lines.Count ? _song.Lines[lineIndex + 1].Text : "";
+        if (_smoothLyricsScroll)
+        {
+            RenderSmoothLyrics(lineIndex, karaokePos);
+            ApplyLyricsScroll(lineIndex, karaokePos);
+        }
+        else
+        {
+            PrevLineText.Text = lineIndex > 0 ? _song.Lines[lineIndex - 1].Text : "";
+            NextLineText.Text = lineIndex + 1 < _song.Lines.Count ? _song.Lines[lineIndex + 1].Text : "";
 
-        RenderWords(_song.Lines[lineIndex], karaokePos);
+            RenderWords(_song.Lines[lineIndex], karaokePos);
+            ResetLyricsScroll();
+        }
+    }
+
+    private void ApplyLyricsScroll(int lineIndex, int posMs)
+    {
+        if (!_smoothLyricsScroll
+            || _song == null
+            || lineIndex < 0
+            || lineIndex >= _song.Lines.Count
+            || LyricsViewport.ActualHeight <= 0)
+        {
+            ResetLyricsScroll();
+            return;
+        }
+
+        KaraokeLine line = _song.Lines[lineIndex];
+
+        int start = line.StartMs;
+        int nextStart = lineIndex + 1 < _song.Lines.Count
+            ? _song.Lines[lineIndex + 1].StartMs
+            : Math.Max(line.EndMs, line.StartMs + 4000);
+
+        int span = Math.Max(500, nextStart - start);
+        double progress = Math.Clamp((posMs - start) / (double)span, 0.0, 1.0);
+
+        // V plynulém režimu mají všechny tři řádky stejnou výšku i stejný font.
+        // Díky tomu odjíždějící řádek při přechodu nezmění velikost.
+        double rowCenterDistance = LyricsViewport.ActualHeight / 3.0;
+        LyricsMoveTransform.Y = rowCenterDistance * (0.5 - progress);
+    }
+
+    private void ResetLyricsScroll()
+    {
+        if (LyricsMoveTransform != null)
+            LyricsMoveTransform.Y = 0;
     }
 
     private int PositionMs()
@@ -313,46 +402,305 @@ public partial class MainWindow : Window
 
     private void RenderEmpty(string text)
     {
+        ResetLyricsScroll();
         PrevLineText.Text = "";
         NextLineText.Text = "";
         WordsPanel.Children.Clear();
+        SmoothPrevPanel.Children.Clear();
+        SmoothCurrentPanel.Children.Clear();
+        SmoothNextPanel.Children.Clear();
 
-        WordsPanel.Children.Add(new TextBlock
+        var block = new TextBlock
         {
             Text = text,
             FontSize = 58,
             FontWeight = FontWeights.Bold,
             Foreground = Brushes.White,
-            TextAlignment = TextAlignment.Center
+            TextAlignment = TextAlignment.Center,
+            TextWrapping = TextWrapping.Wrap
+        };
+
+        if (_smoothLyricsScroll)
+            SmoothCurrentPanel.Children.Add(block);
+        else
+            WordsPanel.Children.Add(block);
+    }
+
+    private void RenderSmoothLyrics(int lineIndex, int posMs)
+    {
+        SmoothPrevPanel.Children.Clear();
+        SmoothCurrentPanel.Children.Clear();
+        SmoothNextPanel.Children.Clear();
+
+        if (_song == null)
+            return;
+
+        double maxWidth = Math.Max(240, LyricsViewport.ActualWidth - 140);
+        SmoothPrevPanel.MaxWidth = maxWidth;
+        SmoothCurrentPanel.MaxWidth = maxWidth;
+        SmoothNextPanel.MaxWidth = maxWidth;
+
+        if (lineIndex > 0)
+        {
+            AddSmoothPlainLine(
+                SmoothPrevPanel,
+                _song.Lines[lineIndex - 1].Text,
+                Brushes.DeepSkyBlue,
+                0.70,
+                maxWidth);
+        }
+
+        RenderSmoothCurrentWords(_song.Lines[lineIndex], posMs, maxWidth);
+
+        if (lineIndex + 1 < _song.Lines.Count)
+        {
+            AddSmoothPlainLine(
+                SmoothNextPanel,
+                _song.Lines[lineIndex + 1].Text,
+                Brushes.WhiteSmoke,
+                0.95,
+                maxWidth);
+        }
+    }
+
+    private static void AddSmoothPlainLine(Panel target, string text, Brush foreground, double opacity, double maxWidth)
+    {
+        target.Children.Add(new TextBlock
+        {
+            Text = string.IsNullOrWhiteSpace(text) ? " " : text,
+            FontSize = SmoothLineFontSize,
+            FontWeight = FontWeights.Bold,
+            Foreground = foreground,
+            Opacity = opacity,
+            TextAlignment = TextAlignment.Center,
+            TextWrapping = TextWrapping.Wrap,
+            MaxWidth = maxWidth,
+            Margin = new Thickness(4)
         });
+    }
+
+    private void RenderSmoothCurrentWords(KaraokeLine line, int posMs, double maxWidth)
+    {
+        string text = line.Text ?? "";
+        if (string.IsNullOrWhiteSpace(text) && line.Words.Count > 0)
+            text = string.Join(" ", line.Words.Select(w => w.Text));
+
+        if (line.Words.Count == 0)
+        {
+            AddSmoothPlainLine(SmoothCurrentPanel, text.Length > 0 ? text : " ", Brushes.WhiteSmoke, 1.0, maxWidth);
+            return;
+        }
+
+        var validWords = line.Words
+            .Where(w => w.CharLength > 0
+                && w.CharStart >= 0
+                && w.CharStart < text.Length)
+            .OrderBy(w => w.CharStart)
+            .ThenBy(w => w.Index)
+            .ToList();
+
+        if (validWords.Count == 0)
+        {
+            // Starý/legacy JSON necháme bez zásahu do původního legacy vykreslení.
+            // V plynulém režimu ho raději ukážeme jako pevný celý řádek, aby neskákal.
+            AddSmoothPlainLine(SmoothCurrentPanel, text.Length > 0 ? text : " ", Brushes.WhiteSmoke, 1.0, maxWidth);
+            return;
+        }
+
+        TextBlock block = MakeLineTextBlock("", SmoothLineFontSize, maxWidth);
+        bool hasCurrentPart = false;
+        int cursor = 0;
+
+        foreach (var w in validWords)
+        {
+            int start = Math.Clamp(w.CharStart, 0, text.Length);
+            int length = Math.Clamp(w.CharLength, 0, text.Length - start);
+
+            if (length <= 0)
+                continue;
+
+            if (start < cursor)
+            {
+                int overlap = cursor - start;
+                if (overlap >= length)
+                    continue;
+
+                start = cursor;
+                length -= overlap;
+            }
+
+            if (start > cursor)
+                AddRun(block, text[cursor..start], past: false, now: false, fixedFontSize: true);
+
+            int end = WordEndMs(line, w);
+            bool now = posMs >= w.TimeMs && posMs < end;
+            bool past = posMs >= end;
+            if (now) hasCurrentPart = true;
+
+            AddRun(block, text.Substring(start, length), past, now, fixedFontSize: true);
+            cursor = start + length;
+        }
+
+        if (cursor < text.Length)
+            AddRun(block, text[cursor..], past: false, now: false, fixedFontSize: true);
+
+        if (hasCurrentPart)
+        {
+            block.Effect = new System.Windows.Media.Effects.DropShadowEffect
+            {
+                Color = Colors.Gold,
+                BlurRadius = 22,
+                ShadowDepth = 0,
+                Opacity = 0.55
+            };
+        }
+
+        SmoothCurrentPanel.Children.Add(block);
     }
 
     private void RenderWords(KaraokeLine line, int posMs)
     {
         WordsPanel.Children.Clear();
 
+        string text = line.Text ?? "";
+        if (string.IsNullOrWhiteSpace(text) && line.Words.Count > 0)
+            text = string.Join(" ", line.Words.Select(w => w.Text));
+
         if (line.Words.Count == 0)
         {
-            WordsPanel.Children.Add(MakeWord(line.Text, false, true));
+            WordsPanel.Children.Add(MakeLineTextBlock(text.Length > 0 ? text : " "));
             return;
         }
 
+        var validWords = line.Words
+            .Where(w => w.CharLength > 0
+                && w.CharStart >= 0
+                && w.CharStart < text.Length)
+            .OrderBy(w => w.CharStart)
+            .ThenBy(w => w.Index)
+            .ToList();
+
+        if (validWords.Count == 0)
+        {
+            // Nouzový fallback pro staré JSONy bez CharStart/CharLength.
+            // Nové JSONy z konvertoru mají pozice a používají větev níže.
+            RenderLegacyWords(line, posMs);
+            return;
+        }
+
+        TextBlock block = MakeLineTextBlock("");
+        bool hasCurrentPart = false;
+        int cursor = 0;
+
+        foreach (var w in validWords)
+        {
+            int start = Math.Clamp(w.CharStart, 0, text.Length);
+            int length = Math.Clamp(w.CharLength, 0, text.Length - start);
+
+            if (length <= 0)
+                continue;
+
+            // Kdyby se části překryly, raději neposuneme text zpět.
+            if (start < cursor)
+            {
+                int overlap = cursor - start;
+                if (overlap >= length)
+                    continue;
+
+                start = cursor;
+                length -= overlap;
+            }
+
+            if (start > cursor)
+                AddRun(block, text[cursor..start], past: false, now: false, fixedFontSize: _smoothLyricsScroll);
+
+            int end = WordEndMs(line, w);
+            bool now = posMs >= w.TimeMs && posMs < end;
+            bool past = posMs >= end;
+            if (now) hasCurrentPart = true;
+
+            AddRun(block, text.Substring(start, length), past, now, fixedFontSize: _smoothLyricsScroll);
+            cursor = start + length;
+        }
+
+        if (cursor < text.Length)
+            AddRun(block, text[cursor..], past: false, now: false, fixedFontSize: _smoothLyricsScroll);
+
+        if (hasCurrentPart)
+        {
+            block.Effect = new System.Windows.Media.Effects.DropShadowEffect
+            {
+                Color = Colors.Gold,
+                BlurRadius = 22,
+                ShadowDepth = 0,
+                Opacity = 0.55
+            };
+        }
+
+        WordsPanel.Children.Add(block);
+    }
+
+    private static int WordEndMs(KaraokeLine line, KaraokeWord word)
+    {
+        if (word.EndMs > word.TimeMs)
+            return word.EndMs;
+
+        int index = line.Words.IndexOf(word);
+        if (index >= 0 && index + 1 < line.Words.Count)
+            return line.Words[index + 1].TimeMs;
+
+        return Math.Max(line.EndMs, word.TimeMs + 300);
+    }
+
+    private static TextBlock MakeLineTextBlock(string text, double fontSize = 60, double maxWidth = 0)
+    {
+        var block = new TextBlock
+        {
+            Text = text,
+            FontSize = fontSize,
+            FontWeight = FontWeights.Bold,
+            Foreground = Brushes.WhiteSmoke,
+            TextAlignment = TextAlignment.Center,
+            TextWrapping = TextWrapping.Wrap,
+            Margin = new Thickness(4)
+        };
+
+        if (maxWidth > 0)
+            block.MaxWidth = maxWidth;
+
+        return block;
+    }
+
+    private static void AddRun(TextBlock block, string text, bool past, bool now, bool fixedFontSize = false)
+    {
+        if (string.IsNullOrEmpty(text))
+            return;
+
+        // V plynulém posunu necháváme všechny části řádku stejně velké.
+        // Jinak Viewbox při zvýraznění slabiky přepočítá měřítko a celý text cukne.
+        // Legacy režim používá vlastní MakeLegacyWord a tímhle se nemění.
+        block.Inlines.Add(new Run(text)
+        {
+            FontSize = fixedFontSize ? 60 : now ? 66 : 60,
+            FontWeight = FontWeights.Bold,
+            Foreground = now ? Brushes.Gold : past ? Brushes.DeepSkyBlue : Brushes.WhiteSmoke
+        });
+    }
+
+    private void RenderLegacyWords(KaraokeLine line, int posMs)
+    {
         for (int i = 0; i < line.Words.Count; i++)
         {
             var w = line.Words[i];
-            int start = w.TimeMs;
-            int end = w.EndMs > w.TimeMs
-                ? w.EndMs
-                : i + 1 < line.Words.Count ? line.Words[i + 1].TimeMs : Math.Max(line.EndMs, w.TimeMs + 300);
-
-            bool now = posMs >= start && posMs < end;
+            int end = WordEndMs(line, w);
+            bool now = posMs >= w.TimeMs && posMs < end;
             bool past = posMs >= end;
 
-            WordsPanel.Children.Add(MakeWord(w.Text, past, now));
+            WordsPanel.Children.Add(MakeLegacyWord(w.Text, past, now));
         }
     }
 
-    private static TextBlock MakeWord(string text, bool past, bool now)
+    private static TextBlock MakeLegacyWord(string text, bool past, bool now)
     {
         return new TextBlock
         {
@@ -377,5 +725,100 @@ public partial class MainWindow : Window
     {
         var t = TimeSpan.FromMilliseconds(Math.Max(0, ms));
         return $"{(int)t.TotalMinutes:00}:{t.Seconds:00}";
+    }
+
+    protected override void OnClosing(CancelEventArgs e)
+    {
+        SaveWindowState();
+        base.OnClosing(e);
+    }
+
+    private void LoadWindowState()
+    {
+        try
+        {
+            if (!File.Exists(WindowSettingsFile))
+                return;
+
+            string json = File.ReadAllText(WindowSettingsFile);
+            var s = JsonSerializer.Deserialize<SavedWindowState>(json);
+
+            if (s == null)
+                return;
+
+            if (s.Width >= MinWidth && s.Height >= MinHeight)
+            {
+                Width = s.Width;
+                Height = s.Height;
+            }
+
+            if (IsWindowPositionVisible(s.Left, s.Top, s.Width, s.Height))
+            {
+                WindowStartupLocation = WindowStartupLocation.Manual;
+                Left = s.Left;
+                Top = s.Top;
+            }
+
+            _smoothLyricsScroll = s.SmoothLyricsScroll;
+            SmoothScrollCheckBox.IsChecked = _smoothLyricsScroll;
+            UpdateLyricsModeVisibility();
+
+            if (s.Maximized)
+                WindowState = WindowState.Maximized;
+        }
+        catch
+        {
+            // Ignorovat poškozené nastavení.
+        }
+    }
+
+    private void SaveWindowState()
+    {
+        try
+        {
+            Directory.CreateDirectory(WindowSettingsDir);
+
+            var bounds = WindowState == WindowState.Normal
+                ? new Rect(Left, Top, Width, Height)
+                : RestoreBounds;
+
+            var s = new SavedWindowState
+            {
+                Width = bounds.Width,
+                Height = bounds.Height,
+                Left = bounds.Left,
+                Top = bounds.Top,
+                Maximized = WindowState == WindowState.Maximized,
+                SmoothLyricsScroll = SmoothScrollCheckBox.IsChecked == true
+            };
+
+            string json = JsonSerializer.Serialize(s, new JsonSerializerOptions
+            {
+                WriteIndented = true
+            });
+
+            File.WriteAllText(WindowSettingsFile, json);
+        }
+        catch
+        {
+            // Ukládání nesmí shodit přehrávač.
+        }
+    }
+
+    private static bool IsWindowPositionVisible(double left, double top, double width, double height)
+    {
+        if (double.IsNaN(left) || double.IsNaN(top) || width <= 0 || height <= 0)
+            return false;
+
+        Rect windowRect = new(left, top, width, height);
+
+        Rect screenRect = new(
+            SystemParameters.VirtualScreenLeft,
+            SystemParameters.VirtualScreenTop,
+            SystemParameters.VirtualScreenWidth,
+            SystemParameters.VirtualScreenHeight
+        );
+
+        return screenRect.IntersectsWith(windowRect);
     }
 }
