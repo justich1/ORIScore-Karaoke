@@ -333,17 +333,20 @@
 
     const lines = linesRaw.map((line, lineIndex) => {
       const wordsRaw = get(line, 'words', 'Words') || [];
+      const lineText = cleanKaraokeText(String(get(line, 'text', 'Text') ?? ''));
 
-      const words = wordsRaw.map((w, wordIndex) => ({
+      const rawWords = wordsRaw.map((w, wordIndex) => ({
         index: Number(get(w, 'index', 'Index') ?? wordIndex),
-        text: String(get(w, 'text', 'Text') ?? ''),
+        text: cleanKaraokeText(String(get(w, 'text', 'Text') ?? '')),
         timeMs: Number(get(w, 'timeMs', 'TimeMs') ?? 0),
         endMs: Number(get(w, 'endMs', 'EndMs') ?? 0)
       }));
 
+      const words = buildTimedSyllableText(lineText, rawWords);
+
       return {
         index: Number(get(line, 'index', 'Index') ?? lineIndex),
-        text: String(get(line, 'text', 'Text') ?? ''),
+        text: lineText,
         startMs: Number(get(line, 'startMs', 'StartMs') ?? (words[0]?.timeMs ?? 0)),
         endMs: Number(get(line, 'endMs', 'EndMs') ?? (words[words.length - 1]?.endMs ?? 0)),
         words
@@ -415,7 +418,7 @@
       parts.push(`<span class="word ${cls}">${escapeHtml(w.text || '')}</span>`);
     }
 
-    els.currentLine.innerHTML = parts.join(' ');
+    els.currentLine.innerHTML = parts.join('');
   }
 
   function nextSong() {
@@ -526,6 +529,56 @@
     }
 
     return undefined;
+  }
+
+
+  function cleanKaraokeText(s) {
+    // Lomítko v exportech z KFN bereme jako oddělovač slabik, ne jako znak k zobrazení.
+    return String(s || '').replace(/\s*\/\s*/g, '');
+  }
+
+  function karaokeMatchText(s) {
+    return String(s || '')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, '');
+  }
+
+  function buildTimedSyllableText(lineText, words) {
+    if (!Array.isArray(words) || words.length === 0) return [];
+    if (!lineText) return words;
+
+    const lineKey = karaokeMatchText(lineText);
+    const wordsKey = karaokeMatchText(words.map(w => w.text || '').join(''));
+
+    // Když řádka a slabiky očividně nepatří k sobě, raději necháme původní texty.
+    if (!lineKey || !wordsKey || lineKey !== wordsKey) return words;
+
+    let pos = 0;
+    const out = words.map(w => ({ ...w }));
+
+    for (let i = 0; i < out.length; i++) {
+      const target = karaokeMatchText(out[i].text || '');
+      if (!target) continue;
+
+      let got = '';
+      let display = '';
+
+      while (pos < lineText.length && got.length < target.length) {
+        const ch = lineText[pos++];
+        display += ch;
+        got += karaokeMatchText(ch);
+      }
+
+      out[i].text = display || out[i].text || '';
+    }
+
+    if (pos < lineText.length && out.length) {
+      out[out.length - 1].text += lineText.slice(pos);
+    }
+
+    return out;
   }
 
   function cleanupAudioName(s) {
