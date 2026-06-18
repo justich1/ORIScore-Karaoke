@@ -2,6 +2,7 @@ using Microsoft.Win32;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.IO;
+using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
@@ -18,6 +19,25 @@ public partial class MainWindow : Window
     private int _offsetMs;
     private bool _mediaReady;
     private bool _draggingSeek;
+    private bool _isDirty;
+    private bool _suppressDirtyTracking;
+
+    private static readonly string WindowSettingsDir = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "ORIScore",
+        "KaraokeEditor"
+    );
+
+    private static readonly string WindowSettingsFile = Path.Combine(WindowSettingsDir, "window.json");
+
+    private sealed class SavedWindowState
+    {
+        public double Width { get; set; }
+        public double Height { get; set; }
+        public double Left { get; set; }
+        public double Top { get; set; }
+        public bool Maximized { get; set; }
+    }
 
     private readonly DispatcherTimer _timer = new() { Interval = TimeSpan.FromMilliseconds(35) };
     private readonly ObservableCollection<WordRow> _wordRows = new();
@@ -26,18 +46,28 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
 
+        Loaded += (_, _) => LoadWindowState();
+
+        TitleBox.TextChanged += (_, _) => MarkDirty();
+        LyricsBox.TextChanged += (_, _) => MarkDirty();
+
         WordsGrid.ItemsSource = _wordRows;
 
         _timer.Tick += (_, _) => RefreshUi();
         _timer.Start();
 
         RebuildPreview();
+        UpdateWindowTitle();
     }
 
     private void NewFromText_Click(object sender, RoutedEventArgs e)
     {
+        if (!ConfirmDiscardUnsavedChanges())
+            return;
+
         BuildFromText();
         _savePath = "";
+        MarkDirty();
     }
 
     private void BuildFromText_Click(object sender, RoutedEventArgs e)
@@ -60,6 +90,7 @@ public partial class MainWindow : Window
 
         TitleText.Text = _song.Title;
         RebuildPreview();
+        MarkDirty();
     }
 
     private void InsertSample_Click(object sender, RoutedEventArgs e)
@@ -73,6 +104,9 @@ public partial class MainWindow : Window
 
     private void OpenJson_Click(object sender, RoutedEventArgs e)
     {
+        if (!ConfirmDiscardUnsavedChanges())
+            return;
+
         var dlg = new OpenFileDialog
         {
             Filter = "ORIScore Karaoke (*.ock)|*.ock|ORIS karaoke JSON (*.karaoke.json;*.json)|*.karaoke.json;*.json|Vše (*.*)|*.*",
@@ -88,6 +122,8 @@ public partial class MainWindow : Window
     {
         try
         {
+            _suppressDirtyTracking = true;
+
             _song = KaraokeSong.Load(path);
             _savePath = path;
             _tapIndex = FirstUntimedWordIndex();
@@ -100,10 +136,15 @@ public partial class MainWindow : Window
                 LoadAudio(_song.AudioPath);
 
             RebuildPreview();
+            SetDirty(false);
         }
         catch (Exception ex)
         {
             MessageBox.Show(this, ex.Message, "Chyba načtení", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+        finally
+        {
+            _suppressDirtyTracking = false;
         }
     }
 
@@ -125,6 +166,7 @@ public partial class MainWindow : Window
         _song.AudioPath = dlg.FileName;
         _song.Audio = Path.GetFileName(dlg.FileName);
         LoadAudio(dlg.FileName);
+        MarkDirty();
         return true;
     }
 
@@ -149,10 +191,14 @@ public partial class MainWindow : Window
         Save(true);
     }
 
-    private void Save(bool saveAs)
+    private bool Save(bool saveAs)
     {
-        if (string.IsNullOrWhiteSpace(_song.Title))
-            _song.Title = string.IsNullOrWhiteSpace(TitleBox.Text) ? "karaoke" : TitleBox.Text.Trim();
+        if (!ConfirmLyricsTextForSave())
+            return false;
+
+        string title = string.IsNullOrWhiteSpace(TitleBox.Text) ? "karaoke" : TitleBox.Text.Trim();
+        _song.Title = title;
+        TitleText.Text = title;
 
         string path = _savePath;
 
@@ -166,7 +212,7 @@ public partial class MainWindow : Window
                 FileName = MakeSafeFileName(_song.Title) + ".ock"
             };
 
-            if (dlg.ShowDialog(this) != true) return;
+            if (dlg.ShowDialog(this) != true) return false;
             path = dlg.FileName;
         }
 
@@ -175,12 +221,15 @@ public partial class MainWindow : Window
             FinalizeEndTimes();
             _song.Save(path);
             _savePath = path;
+            SetDirty(false);
             MessageBox.Show(this, "Uloženo.", "OK", MessageBoxButton.OK, MessageBoxImage.Information);
             RebuildPreview();
+            return true;
         }
         catch (Exception ex)
         {
             MessageBox.Show(this, ex.Message, "Chyba uložení", MessageBoxButton.OK, MessageBoxImage.Error);
+            return false;
         }
     }
 
@@ -203,6 +252,7 @@ public partial class MainWindow : Window
 
         _tapIndex = 0;
         RebuildPreview();
+        MarkDirty();
     }
 
     private void PlayPause_Click(object sender, RoutedEventArgs e)
@@ -250,7 +300,7 @@ public partial class MainWindow : Window
         RebuildPreview();
     }
 
-    private void Window_KeyDown(object sender, KeyEventArgs e)
+    private void Window_PreviewKeyDown(object sender, KeyEventArgs e)
     {
         // Když je kurzor v textovém poli, necháme psát normálně.
         if (Keyboard.FocusedElement is TextBox)
@@ -301,6 +351,7 @@ public partial class MainWindow : Window
         _tapIndex++;
         _song.RecalculateLineTimes();
         RebuildPreview();
+        MarkDirty();
     }
 
     private void StepBack()
@@ -321,6 +372,47 @@ public partial class MainWindow : Window
 
         _song.RecalculateLineTimes();
         RebuildPreview();
+        MarkDirty();
+    }
+
+    private bool ConfirmLyricsTextForSave()
+    {
+        if (!LyricsTextDiffersFromSong())
+            return true;
+
+        var result = MessageBox.Show(
+            this,
+            "Text skladby vlevo byl změněn, ale slova/časy ještě nejsou přepočítané.\n\n" +
+            "Vytvořit slova z aktuálního textu před uložením?\n\n" +
+            "Ano = použít aktuální text a začít časování od něj.\n" +
+            "Ne = uložit aktuální časovanou skladbu bez změn v levém textu.\n" +
+            "Storno = neukládat.",
+            "Text skladby se změnil",
+            MessageBoxButton.YesNoCancel,
+            MessageBoxImage.Warning);
+
+        if (result == MessageBoxResult.Cancel)
+            return false;
+
+        if (result == MessageBoxResult.Yes)
+            BuildFromText();
+
+        return true;
+    }
+
+    private bool LyricsTextDiffersFromSong()
+    {
+        string editorText = NormalizeLyricsText(LyricsBox.Text);
+        string songText = NormalizeLyricsText(string.Join(Environment.NewLine, _song.Lines.Select(l => l.Text)));
+        return !string.Equals(editorText, songText, StringComparison.Ordinal);
+    }
+
+    private static string NormalizeLyricsText(string value)
+    {
+        return (value ?? "")
+            .Replace("\r\n", "\n")
+            .Replace('\r', '\n')
+            .Trim();
     }
 
     private void FinalizeEndTimes()
@@ -497,6 +589,201 @@ public partial class MainWindow : Window
                 }
                 : null
         };
+    }
+
+    private void Help_Click(object sender, RoutedEventArgs e)
+    {
+        var help = new Window
+        {
+            Title = "Nápověda - ORIScore Karaoke Editor",
+            Owner = this,
+            Width = 760,
+            Height = 640,
+            MinWidth = 560,
+            MinHeight = 420,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            Background = new SolidColorBrush(Color.FromRgb(6, 9, 16)),
+            Foreground = Brushes.WhiteSmoke
+        };
+
+        var text = new TextBlock
+        {
+            TextWrapping = TextWrapping.Wrap,
+            FontSize = 15,
+            LineHeight = 22,
+            Foreground = Brushes.WhiteSmoke,
+            Text =
+                "ORIScore Karaoke Editor\n\n" +
+                "Základní postup:\n" +
+                "1. Vlož text skladby vlevo do pole Text skladby.\n" +
+                "2. Vyplň název skladby.\n" +
+                "3. Klikni na Vytvořit slova z textu.\n" +
+                "4. Vyber audio soubor.\n" +
+                "5. Pusť přehrávání klávesou Enter.\n" +
+                "6. Mezerníkem odklepávej čas dalšího slova podle zpěvu.\n" +
+                "7. Když se spleteš, Backspace vrátí poslední odklepnuté slovo.\n" +
+                "8. Nakonec ulož jako .ock.\n\n" +
+                "Klávesy:\n" +
+                "Enter = Play / Pause\n" +
+                "Mezerník = zapsat čas dalšího slova\n" +
+                "Backspace = krok zpět\n\n" +
+                "Poznámky:\n" +
+                "- Když je kurzor v textovém poli, Enter a mezerník píšou normálně.\n" +
+                "- Tlačítka už si neberou fokus, takže mezerník a Enter nebudou náhodně mačkat poslední tlačítko.\n" +
+                "- Pokud zavřeš editor s neuloženými změnami, editor se nejdřív zeptá.\n" +
+                "- Velikost a pozice okna se ukládá do profilu uživatele.\n\n" +
+                "Tip:\n" +
+                "Offset použij, když chceš všechny zapisované časy posunout dopředu nebo dozadu."
+        };
+
+        help.Content = new ScrollViewer
+        {
+            Padding = new Thickness(24),
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            Content = text
+        };
+
+        help.Show();
+    }
+
+    protected override void OnClosing(CancelEventArgs e)
+    {
+        if (!ConfirmDiscardUnsavedChanges())
+        {
+            e.Cancel = true;
+            return;
+        }
+
+        SaveWindowState();
+        base.OnClosing(e);
+    }
+
+    private bool ConfirmDiscardUnsavedChanges()
+    {
+        if (!_isDirty)
+            return true;
+
+        var result = MessageBox.Show(
+            this,
+            "Soubor není uložený.\n\nChceš změny před pokračováním uložit?",
+            "Neuložené změny",
+            MessageBoxButton.YesNoCancel,
+            MessageBoxImage.Warning);
+
+        if (result == MessageBoxResult.Cancel)
+            return false;
+
+        if (result == MessageBoxResult.Yes)
+            return Save(false);
+
+        return true;
+    }
+
+    private void MarkDirty()
+    {
+        if (_suppressDirtyTracking)
+            return;
+
+        SetDirty(true);
+    }
+
+    private void SetDirty(bool value)
+    {
+        _isDirty = value;
+        UpdateWindowTitle();
+    }
+
+    private void UpdateWindowTitle()
+    {
+        string file = string.IsNullOrWhiteSpace(_savePath)
+            ? "bez souboru"
+            : Path.GetFileName(_savePath);
+
+        Title = (_isDirty ? "* " : "") + "ORIScore Karaoke Editor - " + file;
+    }
+
+    private void LoadWindowState()
+    {
+        try
+        {
+            if (!File.Exists(WindowSettingsFile))
+                return;
+
+            string json = File.ReadAllText(WindowSettingsFile);
+            var s = JsonSerializer.Deserialize<SavedWindowState>(json);
+
+            if (s == null)
+                return;
+
+            if (s.Width >= MinWidth && s.Height >= MinHeight)
+            {
+                Width = s.Width;
+                Height = s.Height;
+            }
+
+            if (IsWindowPositionVisible(s.Left, s.Top, s.Width, s.Height))
+            {
+                WindowStartupLocation = WindowStartupLocation.Manual;
+                Left = s.Left;
+                Top = s.Top;
+            }
+
+            if (s.Maximized)
+                WindowState = WindowState.Maximized;
+        }
+        catch
+        {
+            // Poškozené nastavení okna ignorujeme.
+        }
+    }
+
+    private void SaveWindowState()
+    {
+        try
+        {
+            Directory.CreateDirectory(WindowSettingsDir);
+
+            var bounds = WindowState == WindowState.Normal
+                ? new Rect(Left, Top, Width, Height)
+                : RestoreBounds;
+
+            var s = new SavedWindowState
+            {
+                Width = bounds.Width,
+                Height = bounds.Height,
+                Left = bounds.Left,
+                Top = bounds.Top,
+                Maximized = WindowState == WindowState.Maximized
+            };
+
+            string json = JsonSerializer.Serialize(s, new JsonSerializerOptions
+            {
+                WriteIndented = true
+            });
+
+            File.WriteAllText(WindowSettingsFile, json);
+        }
+        catch
+        {
+            // Ukládání nastavení nesmí shodit editor.
+        }
+    }
+
+    private static bool IsWindowPositionVisible(double left, double top, double width, double height)
+    {
+        if (double.IsNaN(left) || double.IsNaN(top) || width <= 0 || height <= 0)
+            return false;
+
+        Rect windowRect = new(left, top, width, height);
+
+        Rect screenRect = new(
+            SystemParameters.VirtualScreenLeft,
+            SystemParameters.VirtualScreenTop,
+            SystemParameters.VirtualScreenWidth,
+            SystemParameters.VirtualScreenHeight
+        );
+
+        return screenRect.IntersectsWith(windowRect);
     }
 
     private int PositionMs()

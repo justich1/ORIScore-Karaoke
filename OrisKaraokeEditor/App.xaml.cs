@@ -1,5 +1,6 @@
 using System.Windows;
 using System.IO;
+using System.Linq;
 
 namespace OrisKaraokeEditorWpf;
 
@@ -9,8 +10,14 @@ public partial class App
     {
         var win = new MainWindow();
 
-        if (e.Args.Length > 0 && File.Exists(e.Args[0]))
-            win.LoadSongFile(e.Args[0]);
+        // Podpora otevření přes asociaci souboru i přes argumenty typu:
+        //   OrisKaraokeEditorWpf.exe "soubor.ock"
+        //   OrisKaraokeEditorWpf.exe /edit "soubor.ock"
+        string? fileToOpen = e.Args
+            .FirstOrDefault(arg => !string.IsNullOrWhiteSpace(arg) && File.Exists(arg));
+
+        if (fileToOpen != null)
+            win.LoadSongFile(Path.GetFullPath(fileToOpen));
 
         win.Show();
     }
